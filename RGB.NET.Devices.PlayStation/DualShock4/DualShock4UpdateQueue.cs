@@ -34,6 +34,7 @@ internal sealed class DualShock4UpdateQueue : UpdateQueue
     #region Properties & Fields
 
     private readonly HidStream _stream;
+    private readonly HidRawWriter? _rawWriter;
     private readonly PlayStationTransport _transport;
     private readonly byte[] _buffer;
     private readonly string _devicePath;
@@ -44,10 +45,11 @@ internal sealed class DualShock4UpdateQueue : UpdateQueue
 
     #region Constructors
 
-    public DualShock4UpdateQueue(IDeviceUpdateTrigger trigger, HidStream stream, PlayStationTransport transport, string devicePath)
+    public DualShock4UpdateQueue(IDeviceUpdateTrigger trigger, HidStream stream, HidRawWriter? rawWriter, PlayStationTransport transport, string devicePath)
         : base(trigger)
     {
         _stream = stream;
+        _rawWriter = rawWriter;
         _transport = transport;
         _devicePath = devicePath ?? string.Empty;
         _buffer = new byte[transport == PlayStationTransport.Bluetooth ? 78 : 32];
@@ -76,24 +78,44 @@ internal sealed class DualShock4UpdateQueue : UpdateQueue
         // colour we see — RGB.NET commits the painted colour for that LED each tick.
         Color color = dataSet[0].color;
 
-        try
+        bool ok;
+        lock (_writeLock)
         {
-            lock (_writeLock)
-            {
-                Array.Clear(_buffer, 0, _buffer.Length);
-                BuildReport(color);
-                _stream.Write(_buffer);
-            }
-            return true;
+            Array.Clear(_buffer, 0, _buffer.Length);
+            BuildReport(color);
+            ok = WriteBuffer();
         }
-        catch (Exception ex)
+
+        if (!ok)
         {
             // Device went away mid-write or another tool grabbed exclusive access.
             // Suspend the queue so the next 30Hz tick short-circuits at the
             // `if (_disposed)` gate. The provider's hot-plug Reconcile will
             // RemoveDevice us shortly.
-            Trace.WriteLine($"[RGB.NET.PlayStation] DualShock4 write failed, suspending queue: {ex.Message}");
+            Trace.WriteLine("[RGB.NET.PlayStation] DualShock4 write failed, suspending queue.");
             _disposed = true;
+            return false;
+        }
+        return true;
+    }
+
+    // On Windows, prefer HidRawWriter (synchronous Win32 WriteFile) — HidSharp's
+    // overlapped HidStream.Write fails on the second and subsequent USB writes
+    // against the PlayStation HID minidriver. On non-Windows or if HidRawWriter
+    // failed to open, fall back to HidStream.Write.
+    private bool WriteBuffer()
+    {
+        if (_rawWriter != null)
+            return _rawWriter.TryWrite(_buffer);
+
+        try
+        {
+            _stream.Write(_buffer);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Trace.WriteLine($"[RGB.NET.PlayStation] DualShock4 stream write threw: {ex.Message}");
             return false;
         }
     }
@@ -169,19 +191,14 @@ internal sealed class DualShock4UpdateQueue : UpdateQueue
         // last colour after we tear down. The controller's firmware restores
         // the OS-driven indicator (e.g. player number) shortly after we stop
         // sending reports anyway, but explicit black avoids the visible "stuck
-        // on last colour" beat between shutdown and firmware reset.
-        try
+        // on last colour" beat between shutdown and firmware reset. Best-effort —
+        // WriteBuffer returns false silently if the handle has already been
+        // invalidated.
+        lock (_writeLock)
         {
-            lock (_writeLock)
-            {
-                Array.Clear(_buffer, 0, _buffer.Length);
-                BuildReport(new Color(0, 0, 0));
-                _stream.Write(_buffer);
-            }
-        }
-        catch
-        {
-            // Best-effort — handle may already have been invalidated.
+            Array.Clear(_buffer, 0, _buffer.Length);
+            BuildReport(new Color(0, 0, 0));
+            WriteBuffer();
         }
     }
 

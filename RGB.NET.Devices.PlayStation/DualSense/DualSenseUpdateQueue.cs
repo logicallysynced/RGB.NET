@@ -65,6 +65,7 @@ internal sealed class DualSenseUpdateQueue : UpdateQueue
     #region Properties & Fields
 
     private readonly HidStream _stream;
+    private readonly HidRawWriter? _rawWriter;
     private readonly PlayStationTransport _transport;
     private readonly byte[] _buffer;
     private readonly string _devicePath;
@@ -77,10 +78,11 @@ internal sealed class DualSenseUpdateQueue : UpdateQueue
 
     #region Constructors
 
-    public DualSenseUpdateQueue(IDeviceUpdateTrigger trigger, HidStream stream, PlayStationTransport transport, string devicePath)
+    public DualSenseUpdateQueue(IDeviceUpdateTrigger trigger, HidStream stream, HidRawWriter? rawWriter, PlayStationTransport transport, string devicePath)
         : base(trigger)
     {
         _stream = stream;
+        _rawWriter = rawWriter;
         _transport = transport;
         _devicePath = devicePath ?? string.Empty;
         _buffer = new byte[transport == PlayStationTransport.Bluetooth ? 78 : 63];
@@ -132,21 +134,39 @@ internal sealed class DualSenseUpdateQueue : UpdateQueue
         // the lightbar at black instead of leaving uninitialised state.
         if (!gotLightbar) lightbar = new Color(0, 0, 0);
 
+        bool ok;
+        lock (_writeLock)
+        {
+            Array.Clear(_buffer, 0, _buffer.Length);
+            BuildReport(lightbar, playerLedBits);
+            ok = WriteBuffer();
+        }
+
+        if (!ok)
+        {
+            Trace.WriteLine("[RGB.NET.PlayStation] DualSense write failed, suspending queue.");
+            _disposed = true;
+            return false;
+        }
+        _firstReport = false;
+        return true;
+    }
+
+    // See DualShock4UpdateQueue.WriteBuffer for the rationale behind preferring
+    // HidRawWriter over HidStream.Write on Windows.
+    private bool WriteBuffer()
+    {
+        if (_rawWriter != null)
+            return _rawWriter.TryWrite(_buffer);
+
         try
         {
-            lock (_writeLock)
-            {
-                Array.Clear(_buffer, 0, _buffer.Length);
-                BuildReport(lightbar, playerLedBits);
-                _stream.Write(_buffer);
-            }
-            _firstReport = false;
+            _stream.Write(_buffer);
             return true;
         }
         catch (Exception ex)
         {
-            Trace.WriteLine($"[RGB.NET.PlayStation] DualSense write failed, suspending queue: {ex.Message}");
-            _disposed = true;
+            Trace.WriteLine($"[RGB.NET.PlayStation] DualSense stream write threw: {ex.Message}");
             return false;
         }
     }
@@ -246,18 +266,13 @@ internal sealed class DualSenseUpdateQueue : UpdateQueue
         if (_disposed) return;
         _disposed = true;
         if (!sendOffFrame) return;
-        try
+        // Best-effort — WriteBuffer returns false silently if the handle has
+        // already been invalidated.
+        lock (_writeLock)
         {
-            lock (_writeLock)
-            {
-                Array.Clear(_buffer, 0, _buffer.Length);
-                BuildReport(new Color(0, 0, 0), 0);
-                _stream.Write(_buffer);
-            }
-        }
-        catch
-        {
-            // Best-effort.
+            Array.Clear(_buffer, 0, _buffer.Length);
+            BuildReport(new Color(0, 0, 0), 0);
+            WriteBuffer();
         }
     }
 

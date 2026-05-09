@@ -104,6 +104,13 @@ public sealed class PlayStationDeviceProvider : AbstractRGBDeviceProvider
     // find them when given the device instance.
     private readonly Dictionary<IRGBDevice, HidStream> _openStreams = [];
     private readonly Dictionary<IRGBDevice, string> _devicePaths = [];
+    // Win32-direct WriteFile wrappers used for the actual lighting writes on
+    // Windows. Kept separate from HidStream because HidSharp's overlapped I/O
+    // path fails on the second and subsequent USB writes against the
+    // PlayStation HID minidriver — see HidRawWriter for the full rationale.
+    // Null entries indicate non-Windows or a failed open; queues fall back to
+    // HidStream.Write in those cases.
+    private readonly Dictionary<IRGBDevice, HidRawWriter?> _rawWriters = [];
 
     // Tracks devices that Reconcile has already confirmed as physically
     // disconnected. RemoveDevice consults this to decide whether the
@@ -283,21 +290,36 @@ public sealed class PlayStationDeviceProvider : AbstractRGBDeviceProvider
 
             PlayStationDeviceInfo info = new(controllerType, transport, serial);
 
+            // On Windows, open a second handle for synchronous WriteFile use.
+            // If this fails (rare — same flags as HidSharp's open which already
+            // succeeded), log and continue with HidStream.Write fallback. On
+            // non-Windows, rawWriter stays null and the queues use HidStream.
+            HidRawWriter? rawWriter = null;
+            if (OperatingSystem.IsWindows() && !string.IsNullOrEmpty(devicePath))
+            {
+                try { rawWriter = new HidRawWriter(devicePath); }
+                catch (Exception writerEx)
+                {
+                    Trace.WriteLine($"[RGB.NET.PlayStation] Could not open raw write handle for {info.DeviceName}: {writerEx.Message} — falling back to HidStream.Write.");
+                }
+            }
+
             IRGBDevice newDevice;
             if (controllerType == PlayStationControllerType.DualShock4)
             {
-                DualShock4UpdateQueue queue = new(GetUpdateTrigger(), opened, transport, devicePath);
+                DualShock4UpdateQueue queue = new(GetUpdateTrigger(), opened, rawWriter, transport, devicePath);
                 newDevice = new DualShock4RGBDevice(info, queue);
             }
             else
             {
-                DualSenseUpdateQueue queue = new(GetUpdateTrigger(), opened, transport, devicePath);
+                DualSenseUpdateQueue queue = new(GetUpdateTrigger(), opened, rawWriter, transport, devicePath);
                 newDevice = new DualSenseRGBDevice(info, queue);
             }
 
             lock (_stateLock)
             {
                 _openStreams[newDevice] = opened;
+                _rawWriters[newDevice] = rawWriter;
                 _devicePaths[newDevice] = devicePath;
             }
 
@@ -516,11 +538,14 @@ public sealed class PlayStationDeviceProvider : AbstractRGBDeviceProvider
     protected override bool RemoveDevice(IRGBDevice device)
     {
         HidStream? stream = null;
+        HidRawWriter? rawWriter = null;
         bool wasConfirmedGone;
         lock (_stateLock)
         {
             if (_openStreams.TryGetValue(device, out stream))
                 _openStreams.Remove(device);
+            if (_rawWriters.TryGetValue(device, out rawWriter))
+                _rawWriters.Remove(device);
             _devicePaths.Remove(device);
             wasConfirmedGone = _confirmedDisconnected.Remove(device);
         }
@@ -528,10 +553,15 @@ public sealed class PlayStationDeviceProvider : AbstractRGBDeviceProvider
         // Send a final off-frame ONLY when removal is voluntary (provider
         // unloaded by the host app). Skip it when the device was confirmed
         // physically gone, or we're inside Dispose. In both skip cases the
-        // write would throw IOException.
+        // write would fail silently anyway.
         bool sendOffFrame = !wasConfirmedGone && !_disposing;
         try { (device as DualShock4RGBDevice)?.Shutdown(sendOffFrame); } catch { /* best effort */ }
         try { (device as DualSenseRGBDevice)?.Shutdown(sendOffFrame); } catch { /* best effort */ }
+
+        if (rawWriter != null)
+        {
+            try { rawWriter.Dispose(); } catch { /* best effort */ }
+        }
 
         if (stream != null)
         {
