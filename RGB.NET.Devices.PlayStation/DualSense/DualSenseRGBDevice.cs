@@ -1,25 +1,40 @@
+using HidSharp;
 using RGB.NET.Core;
 
 namespace RGB.NET.Devices.PlayStation;
 
-/// <inheritdoc />
+/// <inheritdoc cref="AbstractRGBDevice{TDeviceInfo}" />
 /// <summary>
-/// Represents a Sony DualSense controller (PS5 / DualSense Edge).
+/// Represents a Sony DualSense controller (PS5 / DualSense Edge). Owns its
+/// HID I/O directly — the open <see cref="HidStream"/>, the optional Win32
+/// raw-write fallback, and the device path used for identity comparison
+/// during hot-plug — and tears them down on <see cref="Dispose"/>.
 /// </summary>
-public sealed class DualSenseRGBDevice : AbstractRGBDevice<PlayStationDeviceInfo>
+public sealed class DualSenseRGBDevice : AbstractRGBDevice<PlayStationDeviceInfo>, IPlayStationRGBDevice
 {
     #region Properties & Fields
 
     private readonly DualSenseUpdateQueue _updateQueue;
+    private readonly HidStream _stream;
+    private readonly HidRawWriter? _rawWriter;
+
+    /// <inheritdoc />
+    public string DevicePath { get; }
+
+    /// <inheritdoc />
+    public bool IsKnownDisconnected { get; private set; }
 
     #endregion
 
     #region Constructors
 
-    internal DualSenseRGBDevice(PlayStationDeviceInfo deviceInfo, DualSenseUpdateQueue updateQueue)
+    internal DualSenseRGBDevice(PlayStationDeviceInfo deviceInfo, DualSenseUpdateQueue updateQueue, HidStream stream, HidRawWriter? rawWriter, string devicePath)
         : base(deviceInfo, updateQueue)
     {
         _updateQueue = updateQueue;
+        _stream = stream;
+        _rawWriter = rawWriter;
+        DevicePath = devicePath ?? string.Empty;
         InitializeLayout();
     }
 
@@ -58,8 +73,22 @@ public sealed class DualSenseRGBDevice : AbstractRGBDevice<PlayStationDeviceInfo
         }
     }
 
-    internal void SuspendWrites() => _updateQueue.SuspendWrites();
-    internal void Shutdown(bool sendOffFrame = true) => _updateQueue.Shutdown(sendOffFrame);
+    /// <inheritdoc />
+    public void MarkKnownDisconnected()
+    {
+        IsKnownDisconnected = true;
+        try { _updateQueue.SuspendWrites(); } catch { /* best effort */ }
+    }
+
+    /// <inheritdoc />
+    public override void Dispose()
+    {
+        try { _updateQueue.Shutdown(sendOffFrame: !IsKnownDisconnected); } catch { /* best effort */ }
+        try { _rawWriter?.Dispose(); } catch { /* best effort */ }
+        try { _stream.Dispose(); } catch { /* best effort */ }
+
+        base.Dispose();
+    }
 
     #endregion
 }
