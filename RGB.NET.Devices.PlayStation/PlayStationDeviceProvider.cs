@@ -519,17 +519,21 @@ public sealed class PlayStationDeviceProvider : AbstractRGBDeviceProvider
                 _hotplugSubscribed = false;
             }
 
-            // Inside Dispose the OS may have already invalidated the HID
-            // handles even if the controller is physically connected — so
-            // mark every device as known-disconnected first. Their own
-            // Dispose then skips the polite off-frame write that would
-            // throw against the invalid handle. Iterate a copy because
-            // RemoveDevice mutates InternalDevices.
+            // Voluntary teardown: the controller is still physically attached
+            // and its HID handle is still valid (the OS doesn't invalidate
+            // handles just because Dispose is being called). Leave
+            // IsKnownDisconnected alone so each device's Dispose sees it as
+            // false and sends a final all-zero output report — the lightbar
+            // and player indicators blank out instead of freezing on the last
+            // colour they were painted. HidRawWriter.TryWrite is non-throwing
+            // anyway, so a stale handle just fails silently.
+            //
+            // Devices that were already torn down by the PnP path
+            // (Reconcile / SuspendDeadDevices) have IsKnownDisconnected = true
+            // and skip the off-frame correctly on their own.
+            //
+            // Iterate a copy because RemoveDevice mutates InternalDevices.
             List<IPlayStationRGBDevice> snapshot = Devices.OfType<IPlayStationRGBDevice>().ToList();
-            foreach (IPlayStationRGBDevice d in snapshot)
-            {
-                try { d.MarkKnownDisconnected(); } catch { /* best effort */ }
-            }
             foreach (IPlayStationRGBDevice d in snapshot)
             {
                 try { RemoveDevice(d); } catch { /* best effort */ }
