@@ -175,9 +175,9 @@ internal sealed class DualSenseUpdateQueue : UpdateQueue
 
     private void BuildReport(Color lightbar, byte playerLedBits)
     {
-        byte r = (byte)Math.Clamp((int)Math.Round(lightbar.R * 255.0), 0, 255);
-        byte g = (byte)Math.Clamp((int)Math.Round(lightbar.G * 255.0), 0, 255);
-        byte b = (byte)Math.Clamp((int)Math.Round(lightbar.B * 255.0), 0, 255);
+        byte r = lightbar.GetR();
+        byte g = lightbar.GetG();
+        byte b = lightbar.GetB();
 
         int commonOffset; // start of the 47-byte common block within _buffer
 

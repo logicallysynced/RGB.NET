@@ -122,9 +122,9 @@ internal sealed class DualShock4UpdateQueue : UpdateQueue
 
     private void BuildReport(Color color)
     {
-        byte r = (byte)Math.Clamp((int)Math.Round(color.R * 255.0), 0, 255);
-        byte g = (byte)Math.Clamp((int)Math.Round(color.G * 255.0), 0, 255);
-        byte b = (byte)Math.Clamp((int)Math.Round(color.B * 255.0), 0, 255);
+        byte r = color.GetR();
+        byte g = color.GetG();
+        byte b = color.GetB();
 
         if (_transport == PlayStationTransport.Bluetooth)
         {
