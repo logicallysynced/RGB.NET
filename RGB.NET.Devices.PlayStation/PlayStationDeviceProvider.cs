@@ -97,25 +97,13 @@ public sealed class PlayStationDeviceProvider : AbstractRGBDeviceProvider
         }
     }
 
-    // Per-device state needed for lifecycle: the open HidStream (for dispose
-    // on remove) and the HidDevice's DevicePath (for identity comparison
-    // during reconcile, since serial isn't always available, especially on
-    // BT-paired controllers). Both keyed by IRGBDevice so RemoveDevice can
-    // find them when given the device instance.
-    private readonly Dictionary<IRGBDevice, HidStream> _openStreams = [];
-    private readonly Dictionary<IRGBDevice, string> _devicePaths = [];
-    // Win32-direct WriteFile wrappers used for the actual lighting writes on
-    // Windows. Kept separate from HidStream because HidSharp's overlapped I/O
-    // path fails on the second and subsequent USB writes against the
-    // PlayStation HID minidriver — see HidRawWriter for the full rationale.
-    // Null entries indicate non-Windows or a failed open; queues fall back to
-    // HidStream.Write in those cases.
-    private readonly Dictionary<IRGBDevice, HidRawWriter?> _rawWriters = [];
-
-    // Tracks devices that Reconcile has already confirmed as physically
-    // disconnected. RemoveDevice consults this to decide whether the
-    // graceful "send a final all-black frame" attempt is worth making.
-    private readonly HashSet<IRGBDevice> _confirmedDisconnected = [];
+    // Per-device state — HidStream, optional HidRawWriter, DevicePath — lives
+    // on the device class itself (DualShock4RGBDevice / DualSenseRGBDevice)
+    // and is disposed by the device's Dispose. The provider only needs to
+    // know which devices it owns, which it gets via the inherited
+    // <see cref="Devices"/> collection. Hot-plug iteration walks that
+    // collection and reads each <see cref="IPlayStationRGBDevice.DevicePath"/>
+    // off the device.
 
     // Snapshot of currently-alive Sony controller DevicePaths, refreshed
     // synchronously by SuspendDeadDevices on every DeviceList.Changed
@@ -126,14 +114,6 @@ public sealed class PlayStationDeviceProvider : AbstractRGBDeviceProvider
     // promptly, a tick already in flight can still call Write against
     // a now-invalid handle and throw IOException.
     private static volatile HashSet<string> _alivePathsSnapshot = new(StringComparer.OrdinalIgnoreCase);
-
-    // Set true inside Dispose so RemoveDevice can also skip the off-frame
-    // at app shutdown — the OS may already have invalidated the HID
-    // handle even though the controller is physically connected, and
-    // the firmware resets to its default indicator on process exit
-    // regardless of whether we send black first.
-    private volatile bool _disposing;
-    private readonly Lock _stateLock = new();
 
     // Hot-plug bookkeeping: subscription flag (so re-init doesn't double-subscribe),
     // and a serial counter so debounced reconciles on stale enqueues short-circuit.
@@ -308,19 +288,12 @@ public sealed class PlayStationDeviceProvider : AbstractRGBDeviceProvider
             if (controllerType == PlayStationControllerType.DualShock4)
             {
                 DualShock4UpdateQueue queue = new(GetUpdateTrigger(), opened, rawWriter, transport, devicePath);
-                newDevice = new DualShock4RGBDevice(info, queue);
+                newDevice = new DualShock4RGBDevice(info, queue, opened, rawWriter, devicePath);
             }
             else
             {
                 DualSenseUpdateQueue queue = new(GetUpdateTrigger(), opened, rawWriter, transport, devicePath);
-                newDevice = new DualSenseRGBDevice(info, queue);
-            }
-
-            lock (_stateLock)
-            {
-                _openStreams[newDevice] = opened;
-                _rawWriters[newDevice] = rawWriter;
-                _devicePaths[newDevice] = devicePath;
+                newDevice = new DualSenseRGBDevice(info, queue, opened, rawWriter, devicePath);
             }
 
             device = newDevice;
@@ -408,8 +381,9 @@ public sealed class PlayStationDeviceProvider : AbstractRGBDeviceProvider
 
     // Immediate-pass companion to Reconcile. Compares currently-tracked device
     // paths to the live HID enumeration; for anything still held open that no
-    // longer enumerates, suspend writes on its queue AND refresh the alive-
-    // path snapshot UpdateQueues consult per frame.
+    // longer enumerates, mark the device as known-disconnected (suspends its
+    // queue) AND refresh the alive-path snapshot the update queues consult
+    // per frame.
     private void SuspendDeadDevices()
     {
         HashSet<string> currentPaths;
@@ -430,34 +404,22 @@ public sealed class PlayStationDeviceProvider : AbstractRGBDeviceProvider
         // on the next trigger tick (volatile reference write).
         _alivePathsSnapshot = currentPaths;
 
-        List<KeyValuePair<IRGBDevice, string>> snapshot;
-        lock (_stateLock)
+        // Iterate a copy so concurrent removals during Reconcile don't
+        // mutate the collection mid-enumeration.
+        List<IPlayStationRGBDevice> snapshot = Devices.OfType<IPlayStationRGBDevice>().ToList();
+        foreach (IPlayStationRGBDevice device in snapshot)
         {
-            snapshot = [.. _devicePaths];
-        }
+            if (string.IsNullOrEmpty(device.DevicePath)) continue;
+            if (currentPaths.Contains(device.DevicePath)) continue;
+            if (device.IsKnownDisconnected) continue;
 
-        foreach (KeyValuePair<IRGBDevice, string> kvp in snapshot)
-        {
-            if (string.IsNullOrEmpty(kvp.Value)) continue;
-            if (currentPaths.Contains(kvp.Value)) continue;
-
-            // Mark as confirmed gone so when the debounced Reconcile gets here
-            // it skips the off-frame write in RemoveDevice.
-            lock (_stateLock) { _confirmedDisconnected.Add(kvp.Key); }
-
-            switch (kvp.Key)
-            {
-                case DualShock4RGBDevice ds4: ds4.SuspendWrites(); break;
-                case DualSenseRGBDevice ds: ds.SuspendWrites(); break;
-            }
+            device.MarkKnownDisconnected();
         }
     }
 
     // Compare current HID enumeration to the open set; add new ones, remove
-    // gone ones. Called from the debounced PnP callback. Holds _stateLock for
-    // the snapshot read so we don't race with a concurrent Dispose; opens and
-    // AddDevice/RemoveDevice are done outside the lock so we don't deadlock
-    // against any handler that might call back into the provider.
+    // gone ones. Called from the debounced PnP callback. Iterates the
+    // device collection directly — each device knows its own DevicePath.
     private void Reconcile()
     {
         HashSet<string> currentPaths;
@@ -475,33 +437,28 @@ public sealed class PlayStationDeviceProvider : AbstractRGBDeviceProvider
             return;
         }
 
-        List<KeyValuePair<IRGBDevice, string>> snapshot;
-        lock (_stateLock)
-        {
-            snapshot = [.. _devicePaths];
-        }
+        List<IPlayStationRGBDevice> snapshot = Devices.OfType<IPlayStationRGBDevice>().ToList();
 
         // Removals first (devices held but no longer enumerated) — done before
         // adds so a controller that quickly reconnects on a different path can
         // be re-added cleanly.
-        foreach (KeyValuePair<IRGBDevice, string> kvp in snapshot)
+        foreach (IPlayStationRGBDevice device in snapshot)
         {
-            if (string.IsNullOrEmpty(kvp.Value)) continue;
-            if (!currentPaths.Contains(kvp.Value))
-            {
-                lock (_stateLock) { _confirmedDisconnected.Add(kvp.Key); }
-                RemoveDevice(kvp.Key);
-            }
+            if (string.IsNullOrEmpty(device.DevicePath)) continue;
+            if (currentPaths.Contains(device.DevicePath)) continue;
+
+            if (!device.IsKnownDisconnected)
+                device.MarkKnownDisconnected();
+            RemoveDevice(device);
         }
 
-        // Additions: any enumerated path not currently open.
-        HashSet<string> openedPaths;
-        lock (_stateLock)
-        {
-            openedPaths = _devicePaths.Values
-                                      .Where(p => !string.IsNullOrEmpty(p))
-                                      .ToHashSet(StringComparer.OrdinalIgnoreCase);
-        }
+        // Additions: any enumerated path not currently open. Re-snapshot Devices
+        // after removals so a controller that disappeared and immediately
+        // reconnected on the same path can be re-added.
+        HashSet<string> openedPaths = Devices.OfType<IPlayStationRGBDevice>()
+                                             .Select(d => d.DevicePath)
+                                             .Where(p => !string.IsNullOrEmpty(p))
+                                             .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
         foreach (HidDevice hid in DeviceList.Local.GetHidDevices(vendorID: SONY_VENDOR_ID))
         {
@@ -537,38 +494,18 @@ public sealed class PlayStationDeviceProvider : AbstractRGBDeviceProvider
     /// <inheritdoc />
     protected override bool RemoveDevice(IRGBDevice device)
     {
-        HidStream? stream = null;
-        HidRawWriter? rawWriter = null;
-        bool wasConfirmedGone;
-        lock (_stateLock)
+        // Provider Dispose marks every device as known-disconnected first,
+        // so the device's own Dispose skips the off-frame attempt in that
+        // case. PnP-driven removal goes through Reconcile which also marks
+        // first. Voluntary host-app removal of a still-connected device
+        // (the rare case) leaves IsKnownDisconnected false, so the device
+        // sends a graceful off-frame before tearing its stream down.
+        bool removed = base.RemoveDevice(device);
+        if (removed)
         {
-            if (_openStreams.TryGetValue(device, out stream))
-                _openStreams.Remove(device);
-            if (_rawWriters.TryGetValue(device, out rawWriter))
-                _rawWriters.Remove(device);
-            _devicePaths.Remove(device);
-            wasConfirmedGone = _confirmedDisconnected.Remove(device);
+            try { device.Dispose(); } catch { /* best effort */ }
         }
-
-        // Send a final off-frame ONLY when removal is voluntary (provider
-        // unloaded by the host app). Skip it when the device was confirmed
-        // physically gone, or we're inside Dispose. In both skip cases the
-        // write would fail silently anyway.
-        bool sendOffFrame = !wasConfirmedGone && !_disposing;
-        try { (device as DualShock4RGBDevice)?.Shutdown(sendOffFrame); } catch { /* best effort */ }
-        try { (device as DualSenseRGBDevice)?.Shutdown(sendOffFrame); } catch { /* best effort */ }
-
-        if (rawWriter != null)
-        {
-            try { rawWriter.Dispose(); } catch { /* best effort */ }
-        }
-
-        if (stream != null)
-        {
-            try { stream.Dispose(); } catch { /* best effort */ }
-        }
-
-        return base.RemoveDevice(device);
+        return removed;
     }
 
     /// <inheritdoc />
@@ -576,22 +513,24 @@ public sealed class PlayStationDeviceProvider : AbstractRGBDeviceProvider
     {
         if (disposing)
         {
-            _disposing = true;
-
             if (_hotplugSubscribed)
             {
                 try { DeviceList.Local.Changed -= OnHidDeviceListChanged; } catch { /* best effort */ }
                 _hotplugSubscribed = false;
             }
 
-            // Snapshot devices to remove. RemoveDevice mutates the dictionaries,
-            // so iterate a copy.
-            List<IRGBDevice> snapshot;
-            lock (_stateLock)
+            // Inside Dispose the OS may have already invalidated the HID
+            // handles even if the controller is physically connected — so
+            // mark every device as known-disconnected first. Their own
+            // Dispose then skips the polite off-frame write that would
+            // throw against the invalid handle. Iterate a copy because
+            // RemoveDevice mutates InternalDevices.
+            List<IPlayStationRGBDevice> snapshot = Devices.OfType<IPlayStationRGBDevice>().ToList();
+            foreach (IPlayStationRGBDevice d in snapshot)
             {
-                snapshot = [.. _openStreams.Keys];
+                try { d.MarkKnownDisconnected(); } catch { /* best effort */ }
             }
-            foreach (IRGBDevice d in snapshot)
+            foreach (IPlayStationRGBDevice d in snapshot)
             {
                 try { RemoveDevice(d); } catch { /* best effort */ }
             }
