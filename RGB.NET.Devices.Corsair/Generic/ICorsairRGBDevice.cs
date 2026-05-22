@@ -7,7 +7,5 @@ namespace RGB.NET.Devices.Corsair;
 /// </summary>
 public interface ICorsairRGBDevice : IRGBDevice
 {
-    internal string DeviceId { get; }
-
     internal void Initialize();
 }
